@@ -1,0 +1,3 @@
+# Browser से cookies export करें
+pip install yt-dlp
+yt-dlp --cookies-from-browser chrome https://youtube.com
