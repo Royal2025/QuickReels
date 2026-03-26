@@ -1,12 +1,12 @@
 """
-🚀 VIDEO ROCKET API - v16.1
-YouTube: Streaming URL | Others: Direct URL
-Frontend handles download, backend only gives URL
+🚀 VIDEO ROCKET API - v17.0
+YouTube: Piped API (No bot detection)
+Others: yt-dlp direct
 """
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 import yt_dlp
 import time
 import asyncio
@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="QuickReels API",
-    version="16.1.0",
-    description="Returns video URL only - Frontend handles download"
+    version="17.0.0",
+    description="YouTube via Piped API | Others via yt-dlp"
 )
 
 # ========== CORS ==========
@@ -112,11 +112,11 @@ def detect_platform(url: str) -> str:
 
 SUPPORTED_PLATFORMS = {'instagram', 'facebook', 'youtube', 'pinterest', 'tiktok', 'twitter', 'reddit'}
 
-# ========== YOUTUBE: STREAMING URL (Frontend download karega) ==========
-async def get_youtube_streaming_url(url: str) -> Dict:
-    """YouTube ka streaming URL do - Frontend fetch karke save karega"""
+# ========== YOUTUBE VIA PIPED API (NO BOT DETECTION) ==========
+async def extract_youtube_piped(url: str) -> Dict:
+    """YouTube via Piped API - No login, no bot detection"""
     try:
-        # Video ID nikal lo
+        # Extract video ID
         video_id = None
         if 'youtu.be' in url:
             video_id = url.split('/')[-1].split('?')[0]
@@ -130,23 +130,52 @@ async def get_youtube_streaming_url(url: str) -> Dict:
         if not video_id:
             return {'success': False, 'error': 'Invalid YouTube URL'}
         
-        # Piped API se streaming URL lo
+        logger.info(f"YouTube Video ID: {video_id}")
+        
+        # Multiple Piped API instances
         piped_apis = [
             f"https://pipedapi.kavin.rocks/streams/{video_id}",
             f"https://pipedapi.adminforge.de/streams/{video_id}",
+            f"https://pipedapi.moomoo.me/streams/{video_id}",
+            f"https://pipedapi.leptons.xyz/streams/{video_id}",
         ]
         
         for api in piped_apis:
             try:
-                response = requests.get(api, timeout=10)
+                response = requests.get(api, timeout=12)
                 if response.status_code == 200:
                     data = response.json()
+                    
+                    # Video streams
                     video_streams = data.get('videoStreams', [])
                     
-                    # Best quality chuno
+                    # Best quality select karo
+                    best_stream = None
                     for stream in video_streams:
                         quality = stream.get('quality', '')
-                        if quality in ['hd', 'medium', 'high', '720', '480', '360']:
+                        if quality in ['hd', '1080', '720', 'medium', '480', '360']:
+                            if not best_stream:
+                                best_stream = stream
+                            elif 'hd' in quality or '1080' in quality:
+                                best_stream = stream
+                    
+                    if best_stream:
+                        video_url = best_stream.get('url')
+                        if video_url:
+                            return {
+                                'success': True,
+                                'url': video_url,
+                                'title': data.get('title', 'YouTube Video'),
+                                'duration': data.get('duration'),
+                                'thumbnail': data.get('thumbnailUrl'),
+                                'platform': 'youtube',
+                                'uploader': data.get('uploader'),
+                                'method': 'piped_api'
+                            }
+                    
+                    # Agar specific stream nahi mila, first valid stream le lo
+                    for stream in video_streams:
+                        if stream.get('url'):
                             return {
                                 'success': True,
                                 'url': stream.get('url'),
@@ -154,59 +183,28 @@ async def get_youtube_streaming_url(url: str) -> Dict:
                                 'duration': data.get('duration'),
                                 'thumbnail': data.get('thumbnailUrl'),
                                 'platform': 'youtube',
-                                'method': 'piped_api',
-                                'note': 'Frontend will fetch and save this URL'
+                                'uploader': data.get('uploader'),
+                                'method': 'piped_api'
                             }
-                    break
-            except:
+                            
+            except Exception as e:
+                logger.warning(f"Piped API {api} failed: {e}")
                 continue
         
-        # Fallback: yt-dlp se streaming URL
-        opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': 'best[ext=mp4]/best',
-            'extract_flat': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            }
-        }
-        
-        def _extract():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        
-        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=20.0)
-        
-        if info:
-            formats = info.get('formats', [])
-            for f in formats:
-                if f.get('ext') == 'mp4' and f.get('acodec') != 'none':
-                    return {
-                        'success': True,
-                        'url': f.get('url'),
-                        'title': info.get('title', 'YouTube Video'),
-                        'duration': info.get('duration'),
-                        'thumbnail': info.get('thumbnail'),
-                        'platform': 'youtube',
-                        'method': 'yt-dlp',
-                        'note': 'Frontend will fetch and save this URL'
-                    }
-        
-        return {'success': False, 'error': 'Could not get YouTube streaming URL'}
+        return {'success': False, 'error': 'All Piped APIs failed. Try again later.'}
         
     except Exception as e:
-        logger.error(f"YouTube error: {e}")
+        logger.error(f"YouTube extraction error: {e}")
         return {'success': False, 'error': str(e)[:100]}
 
-# ========== OTHER PLATFORMS: DIRECT URL (Frontend download karega) ==========
-async def get_direct_url(url: str, platform: str) -> Dict:
-    """Instagram, Facebook, Pinterest etc. ka direct URL"""
+# ========== OTHER PLATFORMS VIA YT-DLP ==========
+async def extract_other_platform(url: str, platform: str) -> Dict:
+    """Instagram, Facebook, Pinterest, TikTok via yt-dlp"""
     
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'format': 'best',  # Simple best
+        'format': 'best',
         'extract_flat': False,
         'ignoreerrors': False,
         'cachedir': False,
@@ -221,6 +219,8 @@ async def get_direct_url(url: str, platform: str) -> Dict:
         opts['http_headers']['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15'
     elif platform == 'tiktok':
         opts['http_headers']['User-Agent'] = 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
+    elif platform == 'pinterest':
+        opts['format'] = 'best[ext=mp4]/best'
     
     def _extract():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -232,7 +232,7 @@ async def get_direct_url(url: str, platform: str) -> Dict:
         if not info:
             return {'success': False, 'error': 'No video info found'}
         
-        # Direct URL nikal lo
+        # Get video URL
         video_url = None
         formats = info.get('formats', [])
         
@@ -255,8 +255,7 @@ async def get_direct_url(url: str, platform: str) -> Dict:
             'thumbnail': info.get('thumbnail'),
             'platform': platform,
             'uploader': info.get('uploader'),
-            'method': 'yt-dlp',
-            'note': 'Frontend will download this URL'
+            'method': 'yt-dlp'
         }
         
     except Exception as e:
@@ -297,14 +296,14 @@ async def process_video(
         if cached:
             cached['response_time'] = round((time.time() - start_time) * 1000, 2)
             cached['instant'] = True
-            logger.info(f"CACHE | {platform}")
+            logger.info(f"CACHE HIT | {platform}")
             return JSONResponse(content=cached)
         
         # Extract based on platform
         if platform == 'youtube':
-            result = await get_youtube_streaming_url(link)
+            result = await extract_youtube_piped(link)
         else:
-            result = await get_direct_url(link, platform)
+            result = await extract_other_platform(link, platform)
         
         response_time = round((time.time() - start_time) * 1000, 2)
         
@@ -321,8 +320,7 @@ async def process_video(
             'uploader': result.get('uploader'),
             'response_time': response_time,
             'instant': False,
-            'method': result.get('method', 'unknown'),
-            'note': 'Frontend: Use fetch + blob to save to device storage'
+            'method': result.get('method', 'unknown')
         }
         
         # Cache it
@@ -341,23 +339,14 @@ async def process_video(
 # ========== HEALTH ==========
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "16.1.0"}
+    return {"status": "healthy", "version": "17.0.0"}
 
 @app.get("/")
 async def root():
-    try:
-        yt_version = yt_dlp.version.__version__
-    except:
-        yt_version = "unknown"
-    
     return {
         "name": "QuickReels API",
-        "version": "16.1.0",
-        "yt_dlp_version": yt_version,
+        "version": "17.0.0",
         "status": "Active",
-        "supported_platforms": list(SUPPORTED_PLATFORMS),
-        "how_it_works": {
-            "youtube": "Returns streaming URL - Frontend fetches and saves",
-            "others": "Returns direct URL - Frontend downloads instantly"
-        }
+        "youtube_method": "Piped API (No bot detection)",
+        "supported_platforms": list(SUPPORTED_PLATFORMS)
     }
