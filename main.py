@@ -1,6 +1,6 @@
 """
-INSTAGRAM VIDEO DOWNLOADER API - IMPROVED VERSION
-Better extraction with cookies and multiple fallback methods
+INSTAGRAM VIDEO DOWNLOADER API - REELS, POSTS, STORIES ONLY
+Real-time cookies support for better extraction
 """
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +15,7 @@ import hashlib
 import random
 import os
 import logging
+import tempfile
 from typing import Dict, Optional
 from collections import OrderedDict
 
@@ -27,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 # ========== CONFIGURATION ==========
 MAX_CACHE_SIZE = 100
-CACHE_TIME = 1800
-MAX_VIDEO_SIZE = 100 * 1024 * 1024
+CACHE_TIME = 1800  # 30 minutes
+MAX_VIDEO_SIZE = 100 * 1024 * 1024  # 100MB
 EXTRACTION_TIMEOUT = 30
 
 # Cache
@@ -58,15 +59,21 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
 ]
 
 def get_ua():
     return random.choice(USER_AGENTS)
 
-def cache_key(url):
-    return hashlib.md5(url.encode()).hexdigest()
+def cache_key(url: str, cookies_hash: str = None) -> str:
+    """Generate cache key with optional cookies hash"""
+    key = url
+    if cookies_hash:
+        key = f"{url}_{cookies_hash}"
+    return hashlib.md5(key.encode()).hexdigest()
 
 def detect_type(url: str) -> str:
+    """Auto detect content type - Only Reels, Posts, Stories"""
     url_lower = url.lower()
     if '/reel/' in url_lower:
         return 'Reel'
@@ -74,42 +81,49 @@ def detect_type(url: str) -> str:
         return 'Post'
     elif '/stories/' in url_lower or '/story/' in url_lower:
         return 'Story'
-    elif '/tv/' in url_lower:
-        return 'IGTV'
     else:
         return 'Video'
 
-def get_cookie_file() -> Optional[str]:
-    """Get cookie file from multiple possible locations"""
-    cookie_paths = [
-        'cookies.txt',
-        '/app/cookies.txt',
-        os.path.join(os.path.dirname(__file__), 'cookies.txt'),
-        os.path.expanduser('~/cookies.txt')
-    ]
-    
-    for path in cookie_paths:
-        if os.path.exists(path):
-            logger.info(f"Found cookies at: {path}")
-            return path
-    
-    logger.warning("No cookies.txt file found! Stories and private content may fail.")
-    return None
+def save_cookies_temp(cookies_str: str) -> str:
+    """Save cookies string to temporary file"""
+    try:
+        # Parse cookies string
+        cookies = {}
+        for cookie in cookies_str.split(';'):
+            if '=' in cookie:
+                key, value = cookie.strip().split('=', 1)
+                cookies[key] = value
+        
+        # Create temp file
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+        
+        # Write in netscape format
+        with open(temp_file.name, 'w') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for key, value in cookies.items():
+                f.write(f".instagram.com\tTRUE\t/\tFALSE\t0\t{key}\t{value}\n")
+        
+        logger.info(f"Cookies saved to temp file")
+        return temp_file.name
+        
+    except Exception as e:
+        logger.error(f"Failed to save cookies: {e}")
+        return None
 
 # ========== LIFESPAN ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting Instagram Video Downloader API")
-    cookie_file = get_cookie_file()
-    if cookie_file:
-        logger.info(f"Cookies loaded from: {cookie_file}")
-    else:
-        logger.warning("Running without cookies - only public content will work")
+    logger.info("Starting Instagram Video Downloader API - Reels, Posts, Stories Only")
     yield
     logger.info("Shutting down...")
     cache.cache.clear()
 
-app = FastAPI(title="Instagram Video Downloader", version="2.2.0", lifespan=lifespan)
+app = FastAPI(
+    title="Instagram Video Downloader", 
+    version="2.3.0", 
+    lifespan=lifespan,
+    description="Download Instagram Reels, Posts, Stories - HD Quality"
+)
 
 # CORS
 app.add_middleware(
@@ -117,16 +131,20 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
 # ========== INSTAGRAM EXTRACTOR ==========
-async def extract_instagram(url: str) -> Dict:
-    """Extract Instagram video with improved methods"""
+async def extract_instagram(url: str, cookies_str: str = None) -> Dict:
+    """Extract Instagram video with optional cookies"""
     
     start = time.time()
     
+    # Generate cache key
+    cookies_hash = hashlib.md5(cookies_str.encode()).hexdigest() if cookies_str else None
+    key = cache_key(url, cookies_hash)
+    
     # Check cache
-    key = cache_key(url)
     cached = cache.get(key)
     if cached and time.time() - cached[1] < CACHE_TIME:
         logger.info(f"Cache hit for: {url[:50]}...")
@@ -137,102 +155,100 @@ async def extract_instagram(url: str) -> Dict:
     content_type = detect_type(url)
     logger.info(f"Extracting {content_type}: {url[:80]}...")
     
-    cookie_file = get_cookie_file()
+    # Prepare yt-dlp options
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'format': 'bestvideo+bestaudio/best[ext=mp4]/best',
+        'http_headers': {
+            'User-Agent': get_ua(),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        },
+        'prefer_insecure': False,
+    }
     
-    # Multiple format attempts with different strategies
-    format_strategies = [
-        'bestvideo+bestaudio/best',
-        'best[ext=mp4]/best',
-        'best',
-    ]
+    # Add cookies if provided
+    temp_cookie_file = None
+    if cookies_str:
+        temp_cookie_file = save_cookies_temp(cookies_str)
+        if temp_cookie_file:
+            opts['cookiefile'] = temp_cookie_file
+            logger.info("Using user cookies for extraction")
     
-    for strategy in format_strategies:
-        try:
-            opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': False,
-                'format': strategy,
-                'http_headers': {
-                    'User-Agent': get_ua(),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                },
-                'prefer_insecure': False,
-                'extract_flat': False,
-            }
+    # Add proxy if configured
+    proxy = os.environ.get('PROXY_URL')
+    if proxy:
+        opts['proxy'] = proxy
+    
+    try:
+        def extract():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        
+        info = await asyncio.wait_for(
+            asyncio.to_thread(extract), 
+            timeout=EXTRACTION_TIMEOUT
+        )
+        
+        if info:
+            # Get video URL
+            video_url = None
             
-            # Add cookies if available
-            if cookie_file:
-                opts['cookiefile'] = cookie_file
-                logger.info("Using cookies for extraction")
+            # Check direct URL
+            if info.get('url'):
+                video_url = info['url']
+            # Check formats
+            elif info.get('formats'):
+                for fmt in info['formats']:
+                    if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
+                        video_url = fmt.get('url')
+                        break
+                if not video_url and info['formats']:
+                    video_url = info['formats'][-1].get('url')
             
-            # Add proxy if configured
-            proxy = os.environ.get('PROXY_URL')
-            if proxy:
-                opts['proxy'] = proxy
-                logger.info(f"Using proxy: {proxy}")
-            
-            def extract():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-            
-            info = await asyncio.wait_for(
-                asyncio.to_thread(extract), 
-                timeout=EXTRACTION_TIMEOUT
-            )
-            
-            if info:
-                # Try to get direct URL
-                video_url = None
+            # Check if valid video URL
+            if video_url and not video_url.endswith(('.mp3', '.m4a', '.aac', '.m3u8')):
+                response_time = (time.time() - start) * 1000
                 
-                # Check for direct URL
-                if info.get('url'):
-                    video_url = info['url']
-                # Check for formats
-                elif info.get('formats'):
-                    # Find best video+audio format
-                    for fmt in info['formats']:
-                        if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':
-                            video_url = fmt.get('url')
-                            break
-                    if not video_url and info['formats']:
-                        video_url = info['formats'][-1].get('url')
+                result = {
+                    'success': True,
+                    'url': video_url,
+                    'title': info.get('title', 'Instagram Video'),
+                    'duration': info.get('duration'),
+                    'thumbnail': info.get('thumbnail'),
+                    'uploader': info.get('uploader', info.get('channel', 'Instagram User')),
+                    'content_type': content_type,
+                    'quality': f"{info.get('height', 'HD')}p" if info.get('height') else 'HD',
+                    'response_time': f"{response_time:.0f}ms",
+                    'from_cache': False
+                }
                 
-                if video_url and not video_url.endswith(('.mp3', '.m4a', '.aac', '.m3u8')):
-                    response_time = (time.time() - start) * 1000
-                    
-                    result = {
-                        'success': True,
-                        'url': video_url,
-                        'title': info.get('title', 'Instagram Video'),
-                        'duration': info.get('duration'),
-                        'thumbnail': info.get('thumbnail'),
-                        'uploader': info.get('uploader', info.get('channel', 'Instagram')),
-                        'content_type': content_type,
-                        'quality': f"{info.get('height', 'HD')}p" if info.get('height') else 'HD',
-                        'response_time': f"{response_time:.0f}ms",
-                        'from_cache': False
-                    }
-                    
-                    cache[key] = (result, time.time())
-                    logger.info(f"Successfully extracted {content_type} in {response_time:.0f}ms")
-                    return result
-                    
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout with strategy: {strategy}")
-            continue
-        except Exception as e:
-            logger.warning(f"Strategy {strategy} failed: {str(e)}")
-            continue
+                # Save to cache
+                cache[key] = (result, time.time())
+                logger.info(f"Successfully extracted {content_type} in {response_time:.0f}ms")
+                return result
+                
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout extracting: {url}")
+    except Exception as e:
+        logger.error(f"Extraction failed: {str(e)}")
+    finally:
+        # Clean up temp cookie file
+        if temp_cookie_file and os.path.exists(temp_cookie_file):
+            try:
+                os.unlink(temp_cookie_file)
+            except:
+                pass
     
     return {
         'success': False, 
-        'error': 'Failed to extract video. Make sure the video is public. For stories and private accounts, cookies are required.'
+        'error': 'Failed to extract video. Make sure the video is public. For stories, login cookies are required.'
     }
 
 # ========== API ENDPOINTS ==========
@@ -240,10 +256,9 @@ async def extract_instagram(url: str) -> Dict:
 async def home():
     return {
         "name": "Instagram Video Downloader API",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "status": "operational",
-        "cookies_available": get_cookie_file() is not None,
-        "features": ["Reels", "Posts", "Stories", "IGTV"],
+        "features": ["Reels", "Posts", "Stories"],
         "limits": {
             "max_video_size_mb": MAX_VIDEO_SIZE // (1024 * 1024),
             "cache_duration_minutes": CACHE_TIME // 60
@@ -256,20 +271,26 @@ async def health():
     return {
         "status": "healthy",
         "cache_size": len(cache.cache),
-        "cookies_available": get_cookie_file() is not None
+        "features": ["Reels", "Posts", "Stories"]
     }
 
 @app.get("/download")
 async def download_video(
     request: Request,
-    url: str = Query(..., description="Instagram video URL")
+    url: str = Query(..., description="Instagram video URL"),
+    cookies: Optional[str] = Query(None, description="Instagram cookies (sessionid=...; mid=...; etc)")
 ):
-    """Download Instagram video"""
+    """Download Instagram Reels, Posts, Stories"""
     
     if not url or 'instagram.com' not in url:
         raise HTTPException(400, "Invalid Instagram URL")
     
-    result = await extract_instagram(url)
+    # Validate content type
+    content_type = detect_type(url)
+    if content_type not in ['Reel', 'Post', 'Story']:
+        raise HTTPException(400, "Only Reels, Posts, and Stories are supported")
+    
+    result = await extract_instagram(url, cookies)
     
     if result.get('success'):
         return JSONResponse(content=result)
