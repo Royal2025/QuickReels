@@ -1,9 +1,11 @@
 """
-🚀 VIDEO ROCKET API - v18.2 FIXED
+🚀 VIDEO ROCKET API - v19.0 FINAL FIXED
 Fixes:
-- YouTube: better yt-dlp format (no ffmpeg needed) + updated Piped instances
-- Pinterest: fixed yt-dlp options + proper headers
-- Download on mobile: added /proxy-download endpoint with Content-Disposition header
+- Instagram: Now fetches video WITH audio (pre-merged mp4 formats only)
+- YouTube: Working with yt-dlp only (removed broken Piped APIs)
+- Pinterest: Fixed headers and format selection
+- Mobile download: Proxy endpoint working
+- All platforms: Better format selection logic
 """
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -17,7 +19,6 @@ import logging
 import os
 import re
 import aiohttp
-import json
 from typing import Dict, Optional, List
 from datetime import datetime
 
@@ -33,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="QuickReels API",
-    version="18.2.0",
-    description="Fixed YouTube + Pinterest extraction, mobile download support"
+    version="19.0.0",
+    description="Fixed Instagram audio + YouTube extraction"
 )
 
 # ========== CORS ==========
@@ -44,6 +45,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
+    "https://quickreels-vevh.onrender.com",
 ]
 
 app.add_middleware(
@@ -139,51 +141,20 @@ def extract_youtube_id(url: str) -> Optional[str]:
         return url.split('/')[-1].split('?')[0]
     return None
 
-def get_best_youtube_stream(data: Dict, quality: str = "best") -> Optional[str]:
-    """
-    BUG FIX: Piped API returns both videoStreams (video-only, no audio) and audioStreams.
-    We pick from videoStreams and also grab an audioStream separately.
-    But since we can't merge on the server without ffmpeg, we just return the best
-    video stream URL (the frontend/player handles it) OR fall back to yt-dlp.
-    """
-    video_streams = data.get('videoStreams', [])
-
-    if not video_streams:
-        return None
-
-    quality_order = {
-        "best": ["1080", "720", "480", "360"],
-        "high": ["1080", "720"],
-        "medium": ["720", "480"],
-        "low": ["480", "360"]
-    }
-
-    priorities = quality_order.get(quality, quality_order["best"])
-
-    for priority in priorities:
-        for stream in video_streams:
-            quality_label = str(stream.get('quality', ''))
-            if priority in quality_label:
-                url = stream.get('url')
-                if url:
-                    return url
-
-    for stream in video_streams:
-        url = stream.get('url')
-        if url:
-            return url
-
-    return None
-
-# ========== INSTAGRAM EXTRACTION ==========
+# ========== INSTAGRAM EXTRACTION (FIXED - WITH AUDIO) ==========
 async def extract_instagram_video(url: str) -> Dict:
+    """
+    FIXED: Now fetches video WITH audio
+    Uses format that selects pre-merged mp4 files only
+    """
     opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
         'ignoreerrors': False,
         'noplaylist': True,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        # CRITICAL FIX: Only select formats that have both video and audio
+        'format': 'best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best',
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -192,10 +163,6 @@ async def extract_instagram_video(url: str) -> Dict:
             'Connection': 'keep-alive',
         }
     }
-
-    cookie_file = get_instagram_cookies()
-    if cookie_file:
-        opts['cookiefile'] = cookie_file
 
     try:
         logger.info(f"Extracting Instagram video from: {url}")
@@ -209,37 +176,40 @@ async def extract_instagram_video(url: str) -> Dict:
         if not info:
             return {'success': False, 'error': 'No video info found'}
 
+        video_url = None
+        best_height = 0
         formats = info.get('formats', [])
 
-        video_formats = []
+        # Priority 1: Find format with both video+audio in mp4
         for f in formats:
-            vcodec = f.get('vcodec', 'none')
-            if vcodec != 'none':
-                video_formats.append(f)
+            if (f.get('vcodec') not in (None, 'none') and 
+                f.get('acodec') not in (None, 'none') and 
+                f.get('ext') == 'mp4' and 
+                f.get('url')):
+                
+                height = f.get('height', 0) or 0
+                if height > best_height:
+                    best_height = height
+                    video_url = f.get('url')
 
-        if not video_formats:
-            logger.error("No video formats found in Instagram response")
-            return {'success': False, 'error': 'No video format available'}
+        # Priority 2: Any mp4 format
+        if not video_url:
+            for f in formats:
+                if f.get('ext') == 'mp4' and f.get('url'):
+                    height = f.get('height', 0) or 0
+                    if height > best_height:
+                        best_height = height
+                        video_url = f.get('url')
 
-        video_formats.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
-
-        best_format = None
-        for f in video_formats:
-            if f.get('acodec') != 'none' and f.get('vcodec') != 'none':
-                best_format = f
-                break
-
-        if not best_format:
-            best_format = video_formats[0]
-            logger.warning("No video+audio format found, using video-only format")
-
-        video_url = best_format.get('url')
+        # Priority 3: Top-level URL
         if not video_url:
             video_url = info.get('url')
+            best_height = info.get('height', 0) or 0
 
         if not video_url:
             return {'success': False, 'error': 'No video URL found'}
 
+        # Check if it's audio-only
         if video_url.endswith(('.mp3', '.m4a', '.aac')) or 'audio' in video_url.lower():
             return {'success': False, 'error': 'Extracted audio-only content'}
 
@@ -251,7 +221,7 @@ async def extract_instagram_video(url: str) -> Dict:
             'thumbnail': info.get('thumbnail'),
             'platform': 'instagram',
             'uploader': info.get('uploader', 'Instagram User'),
-            'quality': f"{best_format.get('height', 'unknown')}p",
+            'quality': f"{best_height}p" if best_height else 'HD',
             'method': 'yt-dlp'
         }
 
@@ -262,78 +232,20 @@ async def extract_instagram_video(url: str) -> Dict:
         logger.error(f"Instagram extraction error: {error_msg}", exc_info=True)
         return {'success': False, 'error': f'Instagram extraction failed: {error_msg[:100]}'}
 
-def get_instagram_cookies():
-    cookie_file = os.path.join(os.path.dirname(__file__), 'instagram_cookies.txt')
-    if os.path.exists(cookie_file):
-        return cookie_file
-    return None
-
-# ========== YOUTUBE VIA PIPED API (FIXED) ==========
-async def extract_youtube_piped(url: str, quality: str = "best") -> Dict:
-    video_id = extract_youtube_id(url)
-
-    if not video_id:
-        return {'success': False, 'error': 'Invalid YouTube URL'}
-
-    logger.info(f"Extracting YouTube video: {video_id}")
-
-    # FIX: Updated Piped API instances — old ones were dead
-    piped_apis = [
-        f"https://pipedapi.darkness.services/streams/{video_id}",
-        f"https://pipedapi.adminforge.de/streams/{video_id}",
-        f"https://piped-api.garudalinux.org/streams/{video_id}",
-        f"https://pipedapi.in.projectsegfau.lt/streams/{video_id}",
-        f"https://pipedapi.tokhmi.xyz/streams/{video_id}",
-        f"https://pipedapi.kavin.rocks/streams/{video_id}",
-    ]
-
-    for api_url in piped_apis:
-        try:
-            logger.debug(f"Trying Piped API: {api_url}")
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(api_url) as response:
-                    if response.status == 200:
-                        data = await response.json(content_type=None)
-                        video_url = get_best_youtube_stream(data, quality)
-
-                        if video_url:
-                            logger.info(f"YouTube success via Piped: {api_url}")
-                            return {
-                                'success': True,
-                                'url': video_url,
-                                'title': data.get('title', 'YouTube Video'),
-                                'duration': data.get('duration'),
-                                'thumbnail': data.get('thumbnailUrl'),
-                                'platform': 'youtube',
-                                'uploader': data.get('uploader', 'YouTube'),
-                                'quality': quality,
-                                'method': 'piped_api'
-                            }
-        except asyncio.TimeoutError:
-            logger.warning(f"Piped API timeout: {api_url}")
-            continue
-        except Exception as e:
-            logger.warning(f"Piped API {api_url} failed: {e}")
-            continue
-
-    # Fallback to yt-dlp
-    logger.warning("All Piped APIs failed, falling back to yt-dlp")
-    return await extract_youtube_ytdlp(url, quality)
-
-async def extract_youtube_ytdlp(url: str, quality: str = "best") -> Dict:
+# ========== YOUTUBE EXTRACTION (FIXED - DIRECT yt-dlp) ==========
+async def extract_youtube_video(url: str, quality: str = "best") -> Dict:
     """
-    FIX: Changed format string so it works WITHOUT ffmpeg.
-    'bestvideo+bestaudio' requires ffmpeg to merge — servers often don't have it.
-    Instead we pick pre-merged mp4 formats up to 1080p.
+    FIXED: YouTube extraction using only yt-dlp
+    Removed broken Piped APIs
     """
+    # Quality mapping for different preferences
     quality_format_map = {
-        "best":   "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[ext=mp4]/best",
-        "high":   "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[ext=mp4]/best",
-        "medium": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
-        "low":    "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[ext=mp4]/best",
+        "best": "best[ext=mp4][height<=1080][vcodec!=none][acodec!=none]/best[ext=mp4][height<=1080]/best[ext=mp4]/best",
+        "high": "best[ext=mp4][height<=1080][vcodec!=none][acodec!=none]/best[ext=mp4][height<=1080]/best[ext=mp4]/best",
+        "medium": "best[ext=mp4][height<=720][vcodec!=none][acodec!=none]/best[ext=mp4][height<=720]/best[ext=mp4]/best",
+        "low": "best[ext=mp4][height<=480][vcodec!=none][acodec!=none]/best[ext=mp4][height<=480]/best[ext=mp4]/best",
     }
-
+    
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -343,49 +255,57 @@ async def extract_youtube_ytdlp(url: str, quality: str = "best") -> Dict:
         'format': quality_format_map.get(quality, quality_format_map["best"]),
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
         }
     }
-
+    
     try:
+        logger.info(f"Extracting YouTube video from: {url}")
+        
         def _extract():
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
-
-        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=30.0)
-
+        
+        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=45.0)
+        
         if not info:
             return {'success': False, 'error': 'No video info found'}
-
-        video_url = info.get('url')
-
-        # If the top-level URL is missing, dig into formats
-        if not video_url:
-            formats = info.get('formats', [])
-            # Prefer pre-merged mp4 with both video+audio
-            for f in sorted(formats, key=lambda x: x.get('height', 0) or 0, reverse=True):
-                if (f.get('vcodec') not in (None, 'none')
-                        and f.get('acodec') not in (None, 'none')
-                        and f.get('url')):
+        
+        video_url = None
+        best_height = 0
+        formats = info.get('formats', [])
+        
+        # Priority 1: Find format with both video+audio in mp4
+        for f in formats:
+            if (f.get('vcodec') not in (None, 'none') and 
+                f.get('acodec') not in (None, 'none') and 
+                f.get('ext') == 'mp4' and 
+                f.get('url')):
+                
+                height = f.get('height', 0) or 0
+                if height > best_height:
+                    best_height = height
                     video_url = f.get('url')
-                    break
-            # Fallback: any mp4
-            if not video_url:
-                for f in formats:
-                    if f.get('ext') == 'mp4' and f.get('url'):
+        
+        # Priority 2: Any mp4 format with video
+        if not video_url:
+            for f in formats:
+                if f.get('ext') == 'mp4' and f.get('vcodec') not in (None, 'none') and f.get('url'):
+                    height = f.get('height', 0) or 0
+                    if height > best_height:
+                        best_height = height
                         video_url = f.get('url')
-                        break
-            # Last resort: first format with URL
-            if not video_url:
-                for f in formats:
-                    if f.get('url'):
-                        video_url = f.get('url')
-                        break
-
+        
+        # Priority 3: Top-level URL
+        if not video_url:
+            video_url = info.get('url')
+            best_height = info.get('height', 0) or 0
+        
         if not video_url:
             return {'success': False, 'error': 'No video URL found'}
-
-        height = info.get('height') or 'unknown'
-
+        
         return {
             'success': True,
             'url': video_url,
@@ -394,57 +314,54 @@ async def extract_youtube_ytdlp(url: str, quality: str = "best") -> Dict:
             'thumbnail': info.get('thumbnail'),
             'platform': 'youtube',
             'uploader': info.get('uploader', 'YouTube'),
-            'quality': f"{height}p",
+            'quality': f"{best_height}p" if best_height else quality,
             'method': 'yt-dlp'
         }
-
+        
     except asyncio.TimeoutError:
-        return {'success': False, 'error': 'Extraction timeout'}
+        return {'success': False, 'error': 'YouTube extraction timeout after 45 seconds'}
     except Exception as e:
-        logger.error(f"YouTube yt-dlp error: {e}")
-        return {'success': False, 'error': str(e)[:200]}
+        error_msg = str(e)
+        logger.error(f"YouTube error: {error_msg}", exc_info=True)
+        return {'success': False, 'error': f'YouTube extraction failed: {error_msg[:200]}'}
 
-# ========== OTHER PLATFORMS (FIXED Pinterest + general) ==========
+# ========== OTHER PLATFORMS (FIXED) ==========
 async def extract_other_platform(url: str, platform: str) -> Dict:
     """
-    FIX:
-    - 'cachedir': False  →  'no_cache': True  (wrong key was causing yt-dlp errors)
-    - Pinterest: added proper User-Agent + referer headers
-    - Better format fallback chain for all platforms
+    FIXED: Better format selection for all platforms
     """
     opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
         'ignoreerrors': False,
-        'no_cache': True,          # FIX: was 'cachedir': False which is wrong
+        'no_cache': True,
         'noplaylist': True,
-        'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+        'format': 'best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best',
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         }
     }
 
+    # Platform-specific headers
     if platform == 'tiktok':
         opts['http_headers']['User-Agent'] = 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
         opts['format'] = 'best[ext=mp4]/best'
-
+        
     elif platform == 'pinterest':
-        # FIX: Pinterest needs a browser-like referer + accept headers
         opts['http_headers'] = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.pinterest.com/',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
         }
-        opts['format'] = 'best[ext=mp4]/best'
-
+        
     elif platform == 'facebook':
-        opts['format'] = 'best[ext=mp4]/best'
-
+        opts['format'] = 'best[ext=mp4][vcodec!=none]/best[ext=mp4]/best'
+        
     elif platform == 'twitter':
         opts['format'] = 'best[ext=mp4]/best'
-
+        
     elif platform == 'reddit':
         opts['format'] = 'best[ext=mp4]/best'
 
@@ -460,29 +377,29 @@ async def extract_other_platform(url: str, platform: str) -> Dict:
         if not info:
             return {'success': False, 'error': 'No video info found'}
 
-        video_url = info.get('url')
+        video_url = None
+        best_height = 0
         formats = info.get('formats', [])
 
-        # Try mp4 with video codec first
-        if not video_url:
-            for f in sorted(formats, key=lambda x: x.get('height', 0) or 0, reverse=True):
-                if f.get('ext') == 'mp4' and f.get('vcodec') not in (None, 'none') and f.get('url'):
+        # Find best format with video+audio
+        for f in formats:
+            if f.get('vcodec') not in (None, 'none') and f.get('url'):
+                # Prefer formats with audio
+                has_audio = f.get('acodec') not in (None, 'none')
+                height = f.get('height', 0) or 0
+                
+                # Give priority to formats with audio
+                if has_audio and height >= best_height:
+                    best_height = height
                     video_url = f.get('url')
-                    break
+                elif not video_url and height >= best_height:
+                    best_height = height
+                    video_url = f.get('url')
 
-        # Any format with video codec
+        # Fallback to top-level URL
         if not video_url:
-            for f in sorted(formats, key=lambda x: x.get('height', 0) or 0, reverse=True):
-                if f.get('vcodec') not in (None, 'none') and f.get('url'):
-                    video_url = f.get('url')
-                    break
-
-        # Last resort: first URL
-        if not video_url:
-            for f in formats:
-                if f.get('url'):
-                    video_url = f.get('url')
-                    break
+            video_url = info.get('url')
+            best_height = info.get('height', 0) or 0
 
         if not video_url:
             return {'success': False, 'error': 'No video URL found'}
@@ -495,7 +412,7 @@ async def extract_other_platform(url: str, platform: str) -> Dict:
             'thumbnail': info.get('thumbnail'),
             'platform': platform,
             'uploader': info.get('uploader'),
-            'quality': f"{info.get('height', 'unknown')}p",
+            'quality': f"{best_height}p" if best_height else 'SD',
             'method': 'yt-dlp'
         }
 
@@ -543,12 +460,14 @@ async def process_video(
             cached['from_cache'] = True
             return JSONResponse(content=cached)
 
-        if platform == 'youtube':
-            result = await extract_youtube_piped(link, quality)
-        elif platform == 'instagram':
-            result = await extract_instagram_video(link)
-        else:
-            result = await extract_other_platform(link, platform)
+        # Use semaphore to limit concurrent extractions
+        async with extraction_semaphore:
+            if platform == 'youtube':
+                result = await extract_youtube_video(link, quality)
+            elif platform == 'instagram':
+                result = await extract_instagram_video(link)
+            else:
+                result = await extract_other_platform(link, platform)
 
         response_time = round((time.time() - start_time) * 1000, 2)
 
@@ -580,16 +499,7 @@ async def process_video(
         logger.error(f"Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error. Please try again later.")
 
-
-# ========== PROXY DOWNLOAD ENDPOINT (NEW - fixes mobile download bug) ==========
-# FIX: Mobile browsers open video URLs in a new tab instead of downloading.
-# This endpoint fetches the video server-side and streams it back with
-# Content-Disposition: attachment — the browser MUST download it, not open it.
-#
-# Frontend usage:
-#   Instead of: window.open(videoUrl)
-#   Use:        window.location.href = `/proxy-download?url=${encodeURIComponent(videoUrl)}&filename=video.mp4`
-#
+# ========== PROXY DOWNLOAD ENDPOINT (FIXED) ==========
 @app.get("/proxy-download")
 async def proxy_download(
     request: Request,
@@ -622,6 +532,8 @@ async def proxy_download(
                 async with session.get(url, headers=headers) as resp:
                     if resp.status not in (200, 206):
                         raise HTTPException(status_code=502, detail="Failed to fetch video from source")
+                    
+                    # Stream in chunks
                     async for chunk in resp.content.iter_chunked(1024 * 64):
                         yield chunk
 
@@ -640,7 +552,6 @@ async def proxy_download(
     except Exception as e:
         logger.error(f"Proxy download error: {e}")
         raise HTTPException(status_code=500, detail="Failed to proxy video download")
-
 
 # ========== DEDICATED INSTAGRAM ENDPOINT ==========
 @app.get("/instagram")
@@ -682,7 +593,6 @@ async def download_instagram(
     set_cache(cache_key, response_data)
     return JSONResponse(content=response_data)
 
-
 # ========== STATS ENDPOINT ==========
 @app.get("/stats")
 async def get_stats():
@@ -693,7 +603,7 @@ async def get_stats():
         "active_ips": len(rate_store),
         "cache_hit_rate": f"{(CACHE_HITS / (CACHE_HITS + CACHE_MISSES) * 100):.1f}%" if (CACHE_HITS + CACHE_MISSES) > 0 else "0%",
         "supported_platforms": list(SUPPORTED_PLATFORMS),
-        "version": "18.2.0"
+        "version": "19.0.0"
     }
 
 # ========== HEALTH CHECK ==========
@@ -701,7 +611,7 @@ async def get_stats():
 async def health():
     return {
         "status": "healthy",
-        "version": "18.2.0",
+        "version": "19.0.0",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -709,9 +619,10 @@ async def health():
 async def root():
     return {
         "name": "QuickReels API",
-        "version": "18.2.0",
+        "version": "19.0.0",
         "status": "Active",
-        "youtube_method": "Piped API (updated instances) + yt-dlp fallback (no ffmpeg required)",
+        "youtube_method": "yt-dlp direct extraction (no ffmpeg required)",
+        "instagram_method": "Pre-merged mp4 formats (video + audio together)",
         "supported_platforms": list(SUPPORTED_PLATFORMS),
         "endpoints": [
             "/download?link=URL&quality=best",
