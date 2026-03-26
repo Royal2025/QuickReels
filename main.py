@@ -1,6 +1,7 @@
 """
-🚀 VIDEO ROCKET API - v14.0
-Latest yt-dlp + Force Download + All Platforms Working
+🚀 VIDEO ROCKET API - v16.1
+YouTube: Streaming URL | Others: Direct URL
+Frontend handles download, backend only gives URL
 """
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -26,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="QuickReels API",
-    version="14.0.0",
-    description="Video extraction with latest yt-dlp"
+    version="16.1.0",
+    description="Returns video URL only - Frontend handles download"
 )
 
 # ========== CORS ==========
@@ -49,47 +50,9 @@ app.add_middleware(
 # ========== CONCURRENCY ==========
 extraction_semaphore = asyncio.Semaphore(5)
 
-# ========== LATEST YT-DLP OPTIONS (Auto-updates) ==========
-def get_ytdlp_opts(platform: str = None) -> dict:
-    """Latest yt-dlp options with all fixes"""
-    
-    # Base options for all platforms
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'ignoreerrors': False,
-        'cachedir': False,
-        'noplaylist': True,
-        'prefer_ffmpeg': False,
-        'format': 'best[ext=mp4]/best',
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
-        }
-    }
-    
-    # Platform-specific tweaks
-    if platform == 'youtube':
-        opts['extractor_args'] = {'youtube': {'skip': ['dash', 'hls']}}
-        opts['http_headers']['Cookie'] = 'CONSENT=YES+IN;'
-    
-    elif platform == 'instagram':
-        opts['http_headers']['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)'
-    
-    elif platform == 'tiktok':
-        opts['http_headers']['User-Agent'] = 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
-    
-    elif platform == 'facebook':
-        opts['http_headers']['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    
-    return opts
-
 # ========== CACHE ==========
 url_cache = {}
-CACHE_TTL = 900  # 15 minutes
+CACHE_TTL = 900
 CACHE_HITS = 0
 CACHE_MISSES = 0
 
@@ -149,11 +112,11 @@ def detect_platform(url: str) -> str:
 
 SUPPORTED_PLATFORMS = {'instagram', 'facebook', 'youtube', 'pinterest', 'tiktok', 'twitter', 'reddit'}
 
-# ========== YOUTUBE FREE API FALLBACK ==========
-async def extract_youtube_free_api(url: str) -> Optional[Dict]:
-    """Free working YouTube API (no key needed)"""
+# ========== YOUTUBE: STREAMING URL (Frontend download karega) ==========
+async def get_youtube_streaming_url(url: str) -> Dict:
+    """YouTube ka streaming URL do - Frontend fetch karke save karega"""
     try:
-        # Extract video ID
+        # Video ID nikal lo
         video_id = None
         if 'youtu.be' in url:
             video_id = url.split('/')[-1].split('?')[0]
@@ -165,9 +128,9 @@ async def extract_youtube_free_api(url: str) -> Optional[Dict]:
             video_id = url.split('/')[-1].split('?')[0]
         
         if not video_id:
-            return None
+            return {'success': False, 'error': 'Invalid YouTube URL'}
         
-        # Method 1: Piped API (working)
+        # Piped API se streaming URL lo
         piped_apis = [
             f"https://pipedapi.kavin.rocks/streams/{video_id}",
             f"https://pipedapi.adminforge.de/streams/{video_id}",
@@ -175,99 +138,114 @@ async def extract_youtube_free_api(url: str) -> Optional[Dict]:
         
         for api in piped_apis:
             try:
-                response = requests.get(api, timeout=8)
+                response = requests.get(api, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
                     video_streams = data.get('videoStreams', [])
                     
+                    # Best quality chuno
                     for stream in video_streams:
-                        if stream.get('quality') in ['hd', 'medium', 'high']:
+                        quality = stream.get('quality', '')
+                        if quality in ['hd', 'medium', 'high', '720', '480', '360']:
                             return {
+                                'success': True,
                                 'url': stream.get('url'),
                                 'title': data.get('title', 'YouTube Video'),
                                 'duration': data.get('duration'),
                                 'thumbnail': data.get('thumbnailUrl'),
                                 'platform': 'youtube',
-                                'method': 'piped_api'
+                                'method': 'piped_api',
+                                'note': 'Frontend will fetch and save this URL'
                             }
+                    break
             except:
                 continue
         
-        # Method 2: Return watch URL
-        return {
-            'url': f"https://www.youtube.com/watch?v={video_id}",
-            'title': 'YouTube Video',
-            'thumbnail': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-            'platform': 'youtube',
-            'method': 'direct_link'
-        }
-        
-    except Exception as e:
-        logger.error(f"Free API error: {e}")
-        return None
-
-# ========== MAIN EXTRACTOR WITH LATEST YT-DLP ==========
-async def extract_video(url: str, platform: str) -> Dict:
-    """Extract video using latest yt-dlp"""
-    acquired = False
-    
-    try:
-        # Semaphore acquire
-        try:
-            await asyncio.wait_for(extraction_semaphore.acquire(), timeout=3.0)
-            acquired = True
-        except asyncio.TimeoutError:
-            return {
-                'success': False,
-                'error': 'Server busy. Please retry.',
-                'busy': True
+        # Fallback: yt-dlp se streaming URL
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'best[ext=mp4]/best',
+            'extract_flat': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
-        
-        # YouTube ke liye pehle free API try karo (faster)
-        if platform == 'youtube':
-            free_result = await extract_youtube_free_api(url)
-            if free_result and free_result.get('url'):
-                free_result['success'] = True
-                return free_result
-        
-        # Latest yt-dlp se extract karo
-        opts = get_ytdlp_opts(platform)
+        }
         
         def _extract():
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         
-        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=35.0)
+        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=20.0)
+        
+        if info:
+            formats = info.get('formats', [])
+            for f in formats:
+                if f.get('ext') == 'mp4' and f.get('acodec') != 'none':
+                    return {
+                        'success': True,
+                        'url': f.get('url'),
+                        'title': info.get('title', 'YouTube Video'),
+                        'duration': info.get('duration'),
+                        'thumbnail': info.get('thumbnail'),
+                        'platform': 'youtube',
+                        'method': 'yt-dlp',
+                        'note': 'Frontend will fetch and save this URL'
+                    }
+        
+        return {'success': False, 'error': 'Could not get YouTube streaming URL'}
+        
+    except Exception as e:
+        logger.error(f"YouTube error: {e}")
+        return {'success': False, 'error': str(e)[:100]}
+
+# ========== OTHER PLATFORMS: DIRECT URL (Frontend download karega) ==========
+async def get_direct_url(url: str, platform: str) -> Dict:
+    """Instagram, Facebook, Pinterest etc. ka direct URL"""
+    
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'best',  # Simple best
+        'extract_flat': False,
+        'ignoreerrors': False,
+        'cachedir': False,
+        'noplaylist': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+    }
+    
+    # Platform-specific headers
+    if platform == 'instagram':
+        opts['http_headers']['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15'
+    elif platform == 'tiktok':
+        opts['http_headers']['User-Agent'] = 'TikTok 26.2.0 rv:262018 (iPhone; iOS 14.4.2; en_US) Cronet'
+    
+    def _extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    
+    try:
+        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=25.0)
         
         if not info:
             return {'success': False, 'error': 'No video info found'}
         
-        # Best video URL find karo
+        # Direct URL nikal lo
         video_url = None
         formats = info.get('formats', [])
         
-        # MP4 with audio pehle
         for f in formats:
-            if f.get('ext') == 'mp4' and f.get('acodec') != 'none':
+            if f.get('url'):
                 video_url = f.get('url')
                 break
-        
-        # Agar nahi mila, koi bhi video with audio
-        if not video_url:
-            for f in formats:
-                if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-                    video_url = f.get('url')
-                    break
-        
-        # Last option: sirf video
-        if not video_url and formats:
-            video_url = formats[0].get('url')
         
         if not video_url:
             video_url = info.get('url')
         
         if not video_url:
-            return {'success': False, 'error': 'No playable URL found'}
+            return {'success': False, 'error': 'No video URL found'}
         
         return {
             'success': True,
@@ -276,26 +254,21 @@ async def extract_video(url: str, platform: str) -> Dict:
             'duration': info.get('duration'),
             'thumbnail': info.get('thumbnail'),
             'platform': platform,
-            'uploader': info.get('uploader') or info.get('channel'),
-            'method': 'yt-dlp'
+            'uploader': info.get('uploader'),
+            'method': 'yt-dlp',
+            'note': 'Frontend will download this URL'
         }
         
-    except asyncio.TimeoutError:
-        return {'success': False, 'error': 'Extraction timeout. Try again.'}
     except Exception as e:
-        logger.error(f"Extraction error: {e}")
-        return {'success': False, 'error': f'Extraction failed: {str(e)[:150]}'}
-    
-    finally:
-        if acquired:
-            extraction_semaphore.release()
+        error_msg = str(e)
+        logger.error(f"{platform} error: {error_msg}")
+        return {'success': False, 'error': error_msg[:100]}
 
-# ========== MAIN DOWNLOAD ENDPOINT ==========
+# ========== MAIN ENDPOINT ==========
 @app.get("/download")
-async def download_video(
+async def process_video(
     request: Request,
-    link: str = Query(..., description="Video URL"),
-    download: bool = Query(False, description="Force download")
+    link: str = Query(..., description="Video URL")
 ):
     start_time = time.time()
     
@@ -324,30 +297,21 @@ async def download_video(
         if cached:
             cached['response_time'] = round((time.time() - start_time) * 1000, 2)
             cached['instant'] = True
-            
-            # Agar download=true hai toh redirect with download headers
-            if download:
-                safe_title = re.sub(r'[^\w\s-]', '', cached.get('title', 'video'))
-                safe_title = safe_title.replace(' ', '_')[:50]
-                
-                return RedirectResponse(
-                    url=cached['url'],
-                    headers={
-                        "Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
-                        "Content-Type": "video/mp4"
-                    }
-                )
-            
+            logger.info(f"CACHE | {platform}")
             return JSONResponse(content=cached)
         
-        # Fresh extraction
-        result = await extract_video(link, platform)
+        # Extract based on platform
+        if platform == 'youtube':
+            result = await get_youtube_streaming_url(link)
+        else:
+            result = await get_direct_url(link, platform)
+        
         response_time = round((time.time() - start_time) * 1000, 2)
         
         if not result.get('success'):
             raise HTTPException(status_code=500, detail=result.get('error', 'Extraction failed'))
         
-        # Prepare response
+        # Response data
         response_data = {
             'url': result['url'],
             'title': result['title'],
@@ -357,26 +321,14 @@ async def download_video(
             'uploader': result.get('uploader'),
             'response_time': response_time,
             'instant': False,
-            'method': result.get('method', 'yt-dlp')
+            'method': result.get('method', 'unknown'),
+            'note': 'Frontend: Use fetch + blob to save to device storage'
         }
         
         # Cache it
         set_cache(cache_key, response_data)
         
         logger.info(f"SUCCESS | {platform} | {result.get('method')} | {response_time}ms")
-        
-        # Agar download=true hai toh redirect with download headers
-        if download:
-            safe_title = re.sub(r'[^\w\s-]', '', result.get('title', 'video'))
-            safe_title = safe_title.replace(' ', '_')[:50]
-            
-            return RedirectResponse(
-                url=result['url'],
-                headers={
-                    "Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
-                    "Content-Type": "video/mp4"
-                }
-            )
         
         return JSONResponse(content=response_data)
     
@@ -386,24 +338,26 @@ async def download_video(
         logger.error(f"Endpoint error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# ========== HEALTH CHECK ==========
+# ========== HEALTH ==========
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "14.0.0"}
+    return {"status": "healthy", "version": "16.1.0"}
 
 @app.get("/")
 async def root():
-    # Check yt-dlp version
-    yt_version = yt_dlp.version.__version__
+    try:
+        yt_version = yt_dlp.version.__version__
+    except:
+        yt_version = "unknown"
     
     return {
         "name": "QuickReels API",
-        "version": "14.0.0",
+        "version": "16.1.0",
         "yt_dlp_version": yt_version,
         "status": "Active",
         "supported_platforms": list(SUPPORTED_PLATFORMS),
-        "features": {
-            "download": "Use ?download=true for force download",
-            "cache": "15 minutes"
+        "how_it_works": {
+            "youtube": "Returns streaming URL - Frontend fetches and saves",
+            "others": "Returns direct URL - Frontend downloads instantly"
         }
     }
