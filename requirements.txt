@@ -1,6 +1,6 @@
-# Core Dependencies - Minimal and Stable
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-yt-dlp==2024.12.23
-requests==2.31.0
-beautifulsoup4==4.12.3
+fastapi
+uvicorn[standard]
+yt-dlp
+requests
+beautifulsoup4
+python-multipart
