@@ -4,3 +4,7 @@ yt-dlp
 requests
 beautifulsoup4
 python-multipart
+fastapi
+uvicorn
+yt-dlp
+aiohttp
